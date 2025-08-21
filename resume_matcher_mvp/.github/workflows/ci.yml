@@ -1,0 +1,28 @@
+name: Resume Matcher CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r resume_matcher_mvp/requirements.txt
+    - name: Lint with flake8
+      run: |
+        pip install flake8
+        flake8 resume_matcher_mvp/src --max-line-length=120
+    - name: Run tests (if present)
+      run: |
+        if [ -d "resume_matcher_mvp/tests" ]; then pytest resume_matcher_mvp/tests; fi
