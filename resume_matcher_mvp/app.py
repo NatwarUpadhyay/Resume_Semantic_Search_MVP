@@ -9,6 +9,8 @@ from typing import List, Tuple
 from src.document_parser import DocumentParser
 from src.embeddings import EmbeddingEngine
 from src.vector_db import VectorDatabase
+from src.domain_classifier import DomainClassifier
+from src.text_profile_parser import TextProfileParser
 from sample_data.sample_jds import get_sample_jd, get_all_roles
 
 class ResumeMatcherApp:
@@ -19,6 +21,8 @@ class ResumeMatcherApp:
         self.parser = DocumentParser()
         self.embedding_engine = EmbeddingEngine()
         self.vector_db = VectorDatabase()
+        self.domain_classifier = DomainClassifier()
+        self.text_profile_parser = TextProfileParser()
         
         # Track uploaded files
         self.uploaded_files = []
@@ -39,6 +43,8 @@ class ResumeMatcherApp:
                 text_content = self.parser.parse_file(file.name)
                 
                 if text_content:
+                    # Classify domain
+                    domain, conf, matched = self.domain_classifier.classify(text_content)
                     # Generate embedding
                     embedding = self.embedding_engine.generate_embedding(text_content)
                     
@@ -50,11 +56,13 @@ class ResumeMatcherApp:
                         text_content=text_content,
                         metadata={
                             "upload_timestamp": datetime.now().isoformat(),
-                            "file_size": os.path.getsize(file.name)
+                            "file_size": os.path.getsize(file.name),
+                            "domain": domain,
+                            "domain_confidence": conf,
                         }
                     )
                     
-                    results.append(f"✅ {filename}: Successfully processed")
+                    results.append(f"✅ {filename}: Successfully processed (domain: {domain}, conf {conf:.2f})")
                     successful_uploads += 1
                 else:
                     results.append(f"❌ {filename}: Failed to extract text")
@@ -66,20 +74,29 @@ class ResumeMatcherApp:
         summary = f"Upload Summary: {successful_uploads}/{len(files)} files processed successfully.\n\n"
         return summary + "\n".join(results)
     
-    def search_resumes(self, job_description: str, top_k: int, min_similarity: float) -> Tuple[pd.DataFrame, str]:
+    def search_resumes(self, job_description: str, top_k: int, min_similarity: float, recruiter_query: str = "") -> Tuple[pd.DataFrame, str]:
         """Search for matching resumes based on job description."""
-        if not job_description.strip():
+        if not job_description.strip() and not recruiter_query.strip():
             return pd.DataFrame(), "Please enter a job description."
         
         try:
-            # Generate embedding for job description
-            jd_embedding = self.embedding_engine.generate_embedding(job_description)
+            # Generate embedding for job description (fallback to recruiter query if JD empty)
+            query_text = job_description.strip() if job_description.strip() else recruiter_query.strip()
+            jd_embedding = self.embedding_engine.generate_embedding(query_text)
+
+            # Domain filter from recruiter query if present
+            where = None
+            if recruiter_query.strip():
+                domain, conf, _ = self.domain_classifier.classify(recruiter_query)
+                if conf >= 0.4:
+                    where = {"domain": domain}
             
             # Search similar resumes
             matches = self.vector_db.search_similar(
                 query_embedding=jd_embedding,
                 top_k=top_k,
-                min_similarity=min_similarity
+                min_similarity=min_similarity,
+                where=where
             )
             
             if not matches:
@@ -106,6 +123,28 @@ class ResumeMatcherApp:
     def load_sample_jd(self, role: str) -> str:
         """Load sample job description."""
         return get_sample_jd(role)
+
+    def ingest_profile_text(self, raw_text: str) -> str:
+        """Parse pasted unstructured profile text, classify domain, embed and store."""
+        if not raw_text or not raw_text.strip():
+            return "No text provided."
+        parsed = self.text_profile_parser.parse(raw_text)
+        domain, conf, matched = self.domain_classifier.classify(raw_text)
+        embedding = self.embedding_engine.generate_embedding(raw_text)
+        metadata = {
+            "upload_timestamp": datetime.now().isoformat(),
+            "source": "paste",
+            "domain": domain,
+            "domain_confidence": conf,
+        }
+        # Use synthetic filename for pasted entries
+        self.vector_db.store_resume(
+            filename=f"pasted_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            embedding=embedding,
+            text_content=raw_text,
+            metadata=metadata,
+        )
+        return f"Profile ingested. Domain: {domain} (conf {conf:.2f}). Items parsed: education={len(parsed.get('education', []))}, projects={len(parsed.get('projects', []))}, experience={len(parsed.get('experience', []))}."
     
     def get_database_stats(self) -> str:
         """Get current database statistics."""
@@ -178,6 +217,14 @@ def create_interface():
                     lines=8,
                     max_lines=15
                 )
+
+                # Recruiter NLP query input
+                recruiter_query = gr.Textbox(
+                    label="Recruiter NLP Query",
+                    placeholder="e.g., MBA marketing Mumbai 2 years experience, SaaS product manager, ...",
+                    lines=2,
+                    max_lines=4
+                )
                 
                 # Search parameters
                 with gr.Row():
@@ -225,7 +272,7 @@ def create_interface():
         
         search_btn.click(
             fn=app.search_resumes,
-            inputs=[job_description, top_k, min_similarity],
+            inputs=[job_description, top_k, min_similarity, recruiter_query],
             outputs=[results_table, search_status]
         )
         
@@ -266,6 +313,17 @@ def create_interface():
             - Adjust similarity threshold based on your requirements
             - Higher similarity scores indicate better matches
             """)
+
+        # Paste-text ingestion panel
+        with gr.Accordion("🧩 Paste Candidate Text", open=False):
+            pasted_text = gr.Textbox(
+                label="Paste Unstructured Candidate Profile Text",
+                placeholder="Paste candidate profile text here...",
+                lines=10
+            )
+            ingest_btn = gr.Button("Ingest Profile Text", variant="secondary")
+            ingest_status = gr.Textbox(label="Ingestion Status", interactive=False)
+            ingest_btn.click(fn=app.ingest_profile_text, inputs=[pasted_text], outputs=[ingest_status])
     
     return interface
 
