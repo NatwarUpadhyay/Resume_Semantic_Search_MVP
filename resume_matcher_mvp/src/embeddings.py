@@ -1,3 +1,20 @@
+# Compatibility shim for sentence-transformers with newer huggingface_hub
+try:
+    import huggingface_hub as _hf
+    if not hasattr(_hf, "cached_download"):
+        try:
+            from huggingface_hub import hf_hub_download as _hf_hub_download  # type: ignore
+        except Exception:
+            _hf_hub_download = None  # type: ignore
+
+        if _hf_hub_download is not None:
+            def _cached_download(*args, **kwargs):  # type: ignore
+                return _hf_hub_download(*args, **kwargs)
+            # attach symbol so `from huggingface_hub import cached_download` works
+            setattr(_hf, "cached_download", _cached_download)
+except Exception:
+    pass
+
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from typing import List, Union

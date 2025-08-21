@@ -1,339 +1,205 @@
 import gradio as gr
-import pandas as pd
-import os
+import re
 from datetime import datetime
-import tempfile
-from typing import List, Tuple
+from typing import Tuple, List, Dict
 
 # Import custom modules
-from src.document_parser import DocumentParser
 from src.embeddings import EmbeddingEngine
-from src.vector_db import VectorDatabase
 from src.domain_classifier import DomainClassifier
 from src.text_profile_parser import TextProfileParser
+from src.role_mapper import RoleMapper
 from sample_data.sample_jds import get_sample_jd, get_all_roles
 
+
 class ResumeMatcherApp:
+    """App refactored for direct JD vs Profile vector similarity.
+
+    This version removes resume uploads and vector DB search. It accepts a Job
+    Description and a Candidate Profile text and computes the cosine similarity
+    between their sentence-transformer embeddings. It also runs a simple domain
+    classifier and parses the profile sections for additional context.
+    """
+
     def __init__(self):
-        print("Initializing Resume Matcher Application...")
-        
-        # Initialize components
-        self.parser = DocumentParser()
+        print("Initializing JD vs Profile Matching Application...")
         self.embedding_engine = EmbeddingEngine()
-        self.vector_db = VectorDatabase()
         self.domain_classifier = DomainClassifier()
         self.text_profile_parser = TextProfileParser()
-        
-        # Track uploaded files
-        self.uploaded_files = []
-        
         print("Application initialized successfully!")
-    
-    def upload_resumes(self, files) -> str:
-        """Process uploaded resume files."""
-        if not files:
-            return "No files uploaded."
-        
-        results = []
-        successful_uploads = 0
-        
-        for file in files:
-            try:
-                # Parse document
-                text_content = self.parser.parse_file(file.name)
-                
-                if text_content:
-                    # Classify domain
-                    domain, conf, matched = self.domain_classifier.classify(text_content)
-                    # Generate embedding
-                    embedding = self.embedding_engine.generate_embedding(text_content)
-                    
-                    # Store in vector database
-                    filename = os.path.basename(file.name)
-                    resume_id = self.vector_db.store_resume(
-                        filename=filename,
-                        embedding=embedding,
-                        text_content=text_content,
-                        metadata={
-                            "upload_timestamp": datetime.now().isoformat(),
-                            "file_size": os.path.getsize(file.name),
-                            "domain": domain,
-                            "domain_confidence": conf,
-                        }
-                    )
-                    
-                    results.append(f"✅ {filename}: Successfully processed (domain: {domain}, conf {conf:.2f})")
-                    successful_uploads += 1
-                else:
-                    results.append(f"❌ {filename}: Failed to extract text")
-                    
-            except Exception as e:
-                filename = os.path.basename(file.name) if hasattr(file, 'name') else "Unknown"
-                results.append(f"❌ {filename}: Error - {str(e)}")
-        
-        summary = f"Upload Summary: {successful_uploads}/{len(files)} files processed successfully.\n\n"
-        return summary + "\n".join(results)
-    
-    def search_resumes(self, job_description: str, top_k: int, min_similarity: float, recruiter_query: str = "") -> Tuple[pd.DataFrame, str]:
-        """Search for matching resumes based on job description."""
-        if not job_description.strip() and not recruiter_query.strip():
-            return pd.DataFrame(), "Please enter a job description."
-        
+
+    # --------------------------
+    # Helpers
+    # --------------------------
+    def _strip_trailing_list(self, text: str) -> str:
+        """Remove a trailing bracketed list (like an array of questions) if present.
+
+        The input sometimes contains a resume-like text followed by a JSON-like
+        array (e.g., interview questions). We remove that to focus similarity on
+        the profile content only.
+        """
+        if not text:
+            return ""
+        lines = text.splitlines()
+        kept: List[str] = []
+        in_block = False
+        for ln in lines:
+            s = ln.strip()
+            if not in_block and s.startswith("["):
+                in_block = True
+                # do not keep this line
+                continue
+            if in_block:
+                if s.endswith("]"):
+                    in_block = False
+                # skip lines inside the bracketed list
+                continue
+            kept.append(ln)
+        cleaned = "\n".join(kept).strip()
+        return cleaned if cleaned else text.strip()
+
+    def _basic_clean(self, text: str) -> str:
+        # Remove excessive asterisks and normalize whitespace
+        t = re.sub(r"\*{2,}", " ", text or "")
+        t = re.sub(r"\s+", " ", t)
+        return t.strip()
+
+    # --------------------------
+    # Core logic
+    # --------------------------
+    def match_profile_to_jd(self, job_description: str, profile_text: str) -> Tuple[float, str]:
+        """Compute similarity between JD and Profile text and return score and details.
+
+        Returns:
+          - similarity score in [0,1]
+          - details string with domain hints, overlapping keywords and parsed stats
+        """
+        jd = (job_description or "").strip()
+        raw_profile = (profile_text or "").strip()
+        if not jd:
+            return 0.0, "Please enter a job description."
+        if not raw_profile:
+            return 0.0, "Please paste the candidate profile text."
+
+        # Preprocess profile: drop trailing Q/A or question list sections
+        prof_main = self._strip_trailing_list(raw_profile)
+        jd_clean = self._basic_clean(jd)
+        prof_clean = self._basic_clean(prof_main)
+
+        # Generate embeddings and compute similarity
         try:
-            # Generate embedding for job description (fallback to recruiter query if JD empty)
-            query_text = job_description.strip() if job_description.strip() else recruiter_query.strip()
-            jd_embedding = self.embedding_engine.generate_embedding(query_text)
-
-            # Domain filter from recruiter query if present
-            where = None
-            if recruiter_query.strip():
-                domain, conf, _ = self.domain_classifier.classify(recruiter_query)
-                if conf >= 0.4:
-                    where = {"domain": domain}
-            
-            # Search similar resumes
-            matches = self.vector_db.search_similar(
-                query_embedding=jd_embedding,
-                top_k=top_k,
-                min_similarity=min_similarity,
-                where=where
-            )
-            
-            if not matches:
-                return pd.DataFrame(), "No matches found. Try lowering the similarity threshold."
-            
-            # Convert to DataFrame for display
-            df_data = []
-            for match in matches:
-                df_data.append({
-                    "Rank": len(df_data) + 1,
-                    "Filename": match["filename"],
-                    "Similarity Score": f"{match['similarity']:.1%}",
-                    "Content Preview": match["content_preview"],
-                })
-            
-            df = pd.DataFrame(df_data)
-            status = f"Found {len(matches)} matching resume(s)."
-            
-            return df, status
-            
+            jd_emb = self.embedding_engine.generate_embedding(jd_clean)
+            prof_emb = self.embedding_engine.generate_embedding(prof_clean)
+            sim = self.embedding_engine.calculate_similarity(jd_emb, prof_emb)
         except Exception as e:
-            return pd.DataFrame(), f"Search error: {str(e)}"
-    
-    def load_sample_jd(self, role: str) -> str:
-        """Load sample job description."""
-        return get_sample_jd(role)
+            return 0.0, f"Embedding error: {str(e)}"
 
-    def ingest_profile_text(self, raw_text: str) -> str:
-        """Parse pasted unstructured profile text, classify domain, embed and store."""
-        if not raw_text or not raw_text.strip():
-            return "No text provided."
-        parsed = self.text_profile_parser.parse(raw_text)
-        domain, conf, matched = self.domain_classifier.classify(raw_text)
-        embedding = self.embedding_engine.generate_embedding(raw_text)
-        metadata = {
-            "upload_timestamp": datetime.now().isoformat(),
-            "source": "paste",
-            "domain": domain,
-            "domain_confidence": conf,
-        }
-        # Use synthetic filename for pasted entries
-        self.vector_db.store_resume(
-            filename=f"pasted_profile_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            embedding=embedding,
-            text_content=raw_text,
-            metadata=metadata,
+        # Domains
+        jd_domain, jd_conf, jd_tokens = self.domain_classifier.classify(jd_clean)
+        pf_domain, pf_conf, pf_tokens = self.domain_classifier.classify(prof_clean)
+
+        # Overlapping domain-related tokens
+        overlap = []
+        try:
+            overlap = sorted(list(set(jd_tokens).intersection(set(pf_tokens))))
+        except Exception:
+            overlap = []
+
+        # Parse profile for section stats
+        parsed = self.text_profile_parser.parse(prof_main)
+        edu_n = len(parsed.get("education", []))
+        ach_n = len(parsed.get("achievements", []))
+        proj_n = len(parsed.get("projects", []))
+        exp_n = len(parsed.get("experience", []))
+        cert_n = len(parsed.get("certificates", []))
+
+        details_lines = [
+            f"Similarity: {sim:.2%}",
+            f"JD domain: {jd_domain} (conf {jd_conf:.2f})",
+            f"Profile domain: {pf_domain} (conf {pf_conf:.2f})",
+        ]
+        if overlap:
+            details_lines.append(f"Overlapping domain keywords: {', '.join(overlap[:12])}")
+        details_lines.append(
+            f"Profile sections parsed -> education: {edu_n}, achievements: {ach_n}, projects: {proj_n}, experience: {exp_n}, certificates: {cert_n}"
         )
-        return f"Profile ingested. Domain: {domain} (conf {conf:.2f}). Items parsed: education={len(parsed.get('education', []))}, projects={len(parsed.get('projects', []))}, experience={len(parsed.get('experience', []))}."
-    
-    def get_database_stats(self) -> str:
-        """Get current database statistics."""
-        stats = self.vector_db.get_collection_stats()
-        return f"Database Status: {stats['total_resumes']} resumes stored"
-    
-    def clear_database(self) -> str:
-        """Clear all data from database."""
-        try:
-            self.vector_db.clear_collection()
-            return "Database cleared successfully!"
-        except Exception as e:
-            return f"Error clearing database: {str(e)}"
+
+        return float(sim), "\n".join(details_lines)
+
 
 def create_interface():
-    """Create and configure Gradio interface."""
+    """Create and configure Gradio interface for JD vs Profile matching."""
     app = ResumeMatcherApp()
-    
-    with gr.Blocks(title="Resume-Job Matching System", theme=gr.themes.Soft()) as interface:
-        gr.Markdown("# 🎯 Resume-Job Matching Semantic Search")
-        gr.Markdown("Upload resumes and find the best matches for your job descriptions using AI-powered semantic search.")
-        
+
+    with gr.Blocks(title="JD ↔ Profile Matching", theme=gr.themes.Soft()) as interface:
+        gr.Markdown("# 🔎 JD ↔ Candidate Profile Semantic Match")
+        gr.Markdown(
+            "**Both inputs support the same structured format** with sections like **Education**, **Projects**, **Work Experience**, etc. The app computes cosine similarity between their embeddings and provides domain analysis."
+        )
+
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("## 📁 Upload Resumes")
-                
-                file_upload = gr.File(
-                    label="Select Resume Files",
-                    file_count="multiple",
-                    file_types=[".pdf", ".docx", ".txt"],
-                    height=200
-                )
-                
-                upload_btn = gr.Button("Process Resumes", variant="primary")
-                upload_status = gr.Textbox(
-                    label="Upload Status",
-                    lines=6,
-                    max_lines=10,
-                    interactive=False
-                )
-                
-                # Database controls
-                gr.Markdown("## 🗄️ Database Controls")
-                db_stats = gr.Textbox(
-                    label="Database Status",
-                    value=app.get_database_stats(),
-                    interactive=False
-                )
-                
-                with gr.Row():
-                    refresh_stats_btn = gr.Button("Refresh Stats")
-                    clear_db_btn = gr.Button("Clear Database", variant="stop")
-            
-            with gr.Column(scale=2):
-                gr.Markdown("## 🔍 Job Description & Search")
-                
-                # Sample JD selection
+                gr.Markdown("## 📋 Job Description / Requirements")
                 with gr.Row():
                     sample_role = gr.Dropdown(
                         choices=get_all_roles(),
                         label="Load Sample JD",
-                        value="Software Engineer"
+                        value="Software Engineer",
                     )
                     load_sample_btn = gr.Button("Load Sample")
-                
-                # Job description input
+
                 job_description = gr.Textbox(
-                    label="Job Description",
-                    placeholder="Enter the job description or requirements...",
-                    lines=8,
-                    max_lines=15
+                    label="Job Description or Requirements",
+                    placeholder="Paste job description or requirements in structured format:\n\n**Requirements**\n- 3+ years Python experience\n- Machine learning background\n\n**Responsibilities**\n- Build ML models\n- Collaborate with teams\n\n(Or use traditional JD format)",
+                    lines=15,
+                    max_lines=25,
                 )
 
-                # Recruiter NLP query input
-                recruiter_query = gr.Textbox(
-                    label="Recruiter NLP Query",
-                    placeholder="e.g., MBA marketing Mumbai 2 years experience, SaaS product manager, ...",
-                    lines=2,
-                    max_lines=4
+            with gr.Column(scale=1):
+                gr.Markdown("## 👤 Candidate Profile")
+                profile_text = gr.Textbox(
+                    label="Candidate Profile Text",
+                    placeholder="Paste candidate profile in structured format:\n\n**Education**\npostgraduate - University Name - CGPA\n\n**Projects**\nProject Name - Description with technologies used\n\n**Work experience and internships**\nfull time - Company - dates - Description\n\n**Achievements**\nachievement - type - Description\n\n(Trailing question lists will be automatically ignored)",
+                    lines=20,
+                    max_lines=30,
                 )
-                
-                # Search parameters
-                with gr.Row():
-                    top_k = gr.Slider(
-                        minimum=1,
-                        maximum=20,
-                        value=10,
-                        step=1,
-                        label="Number of Results"
-                    )
-                    min_similarity = gr.Slider(
-                        minimum=0.0,
-                        maximum=1.0,
-                        value=0.3,
-                        step=0.05,
-                        label="Minimum Similarity"
-                    )
-                
-                search_btn = gr.Button("🔍 Find Matches", variant="primary", size="lg")
-        
-        # Results section
-        gr.Markdown("## 📊 Search Results")
-        
-        search_status = gr.Textbox(
-            label="Search Status",
-            interactive=False
-        )
-        
-        results_table = gr.DataFrame(
-            label="Matching Resumes",
-            headers=["Rank", "Filename", "Similarity Score", "Content Preview"],
-            datatype=["number", "str", "str", "str"],
-            height=400
-        )
-        
-        # Event handlers
-        upload_btn.click(
-            fn=app.upload_resumes,
-            inputs=[file_upload],
-            outputs=[upload_status]
-        ).then(
-            fn=app.get_database_stats,
-            outputs=[db_stats]
-        )
-        
-        search_btn.click(
-            fn=app.search_resumes,
-            inputs=[job_description, top_k, min_similarity, recruiter_query],
-            outputs=[results_table, search_status]
-        )
-        
+
+        compute_btn = gr.Button("Compute Fit", variant="primary")
+
+        with gr.Row():
+            fit_score = gr.Number(label="Fit Score (0–1)", interactive=False)
+            details = gr.Textbox(label="Details", lines=10, max_lines=18, interactive=False)
+
+        # Events
         load_sample_btn.click(
-            fn=app.load_sample_jd,
+            fn=get_sample_jd,
             inputs=[sample_role],
-            outputs=[job_description]
+            outputs=[job_description],
         )
-        
-        refresh_stats_btn.click(
-            fn=app.get_database_stats,
-            outputs=[db_stats]
-        )
-        
-        clear_db_btn.click(
-            fn=app.clear_database,
-            outputs=[upload_status]
-        ).then(
-            fn=app.get_database_stats,
-            outputs=[db_stats]
-        )
-        
-        # Add usage instructions
-        with gr.Accordion("📋 Usage Instructions", open=False):
-            gr.Markdown("""
-            ### How to Use:
-            
-            1. **Upload Resumes**: Select one or more resume files (PDF, DOCX, or TXT format)
-            2. **Process Files**: Click "Process Resumes" to extract text and generate embeddings
-            3. **Enter Job Description**: Type or paste a job description, or load a sample
-            4. **Adjust Parameters**: Set the number of results and minimum similarity threshold
-            5. **Search**: Click "Find Matches" to get ranked results
-            6. **Review Results**: View similarity scores and resume previews
-            
-            ### Tips:
-            - Upload multiple resumes for better comparison
-            - Use detailed job descriptions for more accurate matching
-            - Adjust similarity threshold based on your requirements
-            - Higher similarity scores indicate better matches
-            """)
 
-        # Paste-text ingestion panel
-        with gr.Accordion("🧩 Paste Candidate Text", open=False):
-            pasted_text = gr.Textbox(
-                label="Paste Unstructured Candidate Profile Text",
-                placeholder="Paste candidate profile text here...",
-                lines=10
+        compute_btn.click(
+            fn=app.match_profile_to_jd,
+            inputs=[job_description, profile_text],
+            outputs=[fit_score, details],
+        )
+
+        with gr.Accordion("Usage Notes", open=False):
+            gr.Markdown(
+                """
+                - Fit score is cosine similarity of embeddings; values closer to 1 indicate stronger semantic alignment.
+                - The parser attempts to extract sections like education, achievements, projects, experience, and certificates from the profile text.
+                - If the profile text includes a trailing list (e.g., interview questions), it is ignored for similarity.
+                """
             )
-            ingest_btn = gr.Button("Ingest Profile Text", variant="secondary")
-            ingest_status = gr.Textbox(label="Ingestion Status", interactive=False)
-            ingest_btn.click(fn=app.ingest_profile_text, inputs=[pasted_text], outputs=[ingest_status])
-    
+
     return interface
 
+
 if __name__ == "__main__":
-    # Create and launch interface
-    interface = create_interface()
-    interface.launch(
-        share=False,
+    ui = create_interface()
+    ui.launch(
+        share=True,
         server_name="127.0.0.1",
-        server_port=7860,
+        server_port=None,  # auto-pick a free port
         show_error=True,
-        quiet=False
+        quiet=False,
     )
